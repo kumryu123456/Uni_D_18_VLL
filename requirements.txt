@@ -4,13 +4,12 @@ torchvision>=0.15.0
 numpy>=1.24.0
 Pillow>=9.5.0
 
-# Transformers and Florence-2
-transformers>=4.35.0
-safetensors>=0.4.0
-
 # Data Processing
 pandas>=2.0.0
+
+# Training Utilities
+tensorboard>=2.13.0
 tqdm>=4.65.0
 
-# Optional: For GPU acceleration
-# nvidia-cuda-runtime-cu11>=11.8
+# Data Augmentation (optional but recommended)
+albumentations>=1.3.0

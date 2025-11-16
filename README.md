@@ -1,253 +1,257 @@
-# Query-Based Visual Element Localization
+# 문서 내 시각요소 위치 예측 모델
 
-Vision-Language Model for predicting bounding box locations of visual elements (tables, charts) in document images based on natural language queries.
-
-## 대회 정보
-- **대회명**: 문서 내 시각요소(표·차트) 위치 예측을 위한 질의기반 비전-언어 모델 개발
-- **평가지표**: mIoU (Mean Intersection over Union)
-- **모델**: Florence-2-large-ft (Microsoft)
+질의기반 비전-언어 모델을 이용한 문서 내 표·차트 위치 예측
 
 ---
 
-## 개발 환경
+## 📋 개요
 
-### 하드웨어
-- **GPU**: NVIDIA RTX 3090 (24GB VRAM) 1장 권장
-- **RAM**: 32GB 이상 권장
-- **Storage**: 50GB 이상 (데이터셋 포함)
+문서 이미지와 자연어 질의를 입력받아, 질의와 관련된 시각요소(표, 차트)의 위치를 예측하는 Vision-Language 모델입니다.
 
-### 소프트웨어
-- **OS**: Linux (Ubuntu 20.04+) 또는 Windows WSL2
-- **Python**: 3.8 이상
-- **CUDA**: 11.8 이상
-- **PyTorch**: 2.0 이상
+**평가 지표**: mIoU (Mean Intersection over Union)
 
 ---
 
-## 설치 방법
+## 🖥️ 개발 환경
 
-### 1. 가상환경 생성 및 활성화
-```bash
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# 또는
-venv\Scripts\activate  # Windows
-```
-
-### 2. 의존성 설치
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-### 3. 데이터셋 준비
-대회에서 제공하는 데이터를 다운로드하여 다음과 같이 배치:
-
-```
-data/
-├── train/
-│   ├── report_json/
-│   ├── report_jpg/
-│   ├── press_json/
-│   └── press_jpg/
-├── valid/
-│   ├── report_json/
-│   ├── report_jpg/
-│   ├── press_json/
-│   └── press_jpg/
-└── test/
-    ├── images/
-    └── query/
-```
+- **OS**: Linux (Ubuntu 20.04+)
+- **Python**: 3.8+
+- **GPU**: CUDA 11.0+ (권장)
 
 ---
 
-## 사용 방법
+## 📦 사전 학습 모델
 
-### 학습 (Training)
+본 프로젝트는 다음 사전학습 모델을 사용합니다:
 
-#### 기본 학습
-```bash
-python train.py \
-  --train_press_json ./data/train/press_json \
-  --train_press_jpg ./data/train/press_jpg \
-  --train_report_json ./data/train/report_json \
-  --train_report_jpg ./data/train/report_jpg \
-  --valid_press_json ./data/valid/press_json \
-  --valid_press_jpg ./data/valid/press_jpg \
-  --valid_report_json ./data/valid/report_json \
-  --valid_report_jpg ./data/valid/report_jpg \
-  --epochs 10 \
-  --batch_size 32 \
-  --lr 5e-5 \
-  --output_dir ./outputs/florence2_bbox
-```
-
-#### 주요 하이퍼파라미터
-- `--epochs`: 학습 에포크 수 (기본값: 10)
-- `--batch_size`: 배치 크기 (기본값: 32, VRAM 부족 시 16 또는 8로 조정)
-- `--lr`: 학습률 (기본값: 5e-5)
-- `--max_train_samples`: 학습 샘플 수 제한 (기본값: 8000)
-- `--max_valid_samples`: 검증 샘플 수 제한 (기본값: 2000)
-
-### 추론 (Inference)
-
-#### 테스트 데이터 예측
-```bash
-python test.py \
-  --test_dir ./data/test \
-  --model_dir ./outputs/florence2_bbox/best \
-  --batch_size 16 \
-  --output_csv ./submission.csv
-```
-
-#### 출력 형식
-생성된 CSV 파일은 다음과 같은 형식을 가집니다:
-```csv
-query_id,query_text,pred_x,pred_y,pred_w,pred_h
-instance_001,2023년 매출 추이 표,125.3,456.7,890.2,345.6
-```
+### ResNet50 (torchvision)
+- **용도**: 이미지 특징 추출 백본
+- **출처**: PyTorch 공식 torchvision
+- **가중치**: ImageNet-1K pretrained weights
+- **다운로드**: 자동 다운로드 (`torchvision.models.resnet50(weights=ResNet50_Weights.DEFAULT)`)
+- **라이선스**: BSD 3-Clause License
+- **참고**: https://pytorch.org/vision/stable/models.html
 
 ---
 
-## 모델 아키텍처
-
-### Florence-2-large-ft
-- **개발사**: Microsoft
-- **유형**: Vision-Language Foundation Model
-- **특징**:
-  - 멀티모달 비전-언어 그라운딩
-  - 한국어 쿼리 지원
-  - Document understanding 특화
-  - Phrase grounding task 수행
-
-### 학습 전략
-1. **데이터 전처리**
-   - 문서 이미지 로딩 및 리사이징
-   - 한국어 자연어 쿼리 토크나이징
-   - Bounding box 정규화 (Florence-2 loc 토큰 형식)
-
-2. **카테고리 균형 샘플링**
-   - 표, 차트 종류별 균등 분포 유지
-   - 과적합 방지
-
-3. **학습**
-   - AdamW optimizer
-   - Cosine learning rate scheduling with warmup
-   - Gradient clipping (max_norm=1.0)
-   - Mixed precision training 지원
-
-4. **평가**
-   - Validation set에서 실시간 mIoU 계산
-   - Best model checkpoint 저장
-
----
-
-## 사전학습 모델 정보
-
-### Florence-2-large-ft
-- **출처**: [microsoft/Florence-2-large-ft](https://huggingface.co/microsoft/Florence-2-large-ft)
-- **라이센스**: MIT License
-- **다운로드**: Transformers library를 통해 자동 다운로드
-- **사용 목적**: Vision-language grounding for document understanding
-
-```python
-# 모델 자동 다운로드 (train.py 실행 시)
-from transformers import AutoModelForCausalLM, AutoProcessor
-
-model = AutoModelForCausalLM.from_pretrained(
-    "microsoft/Florence-2-large-ft",
-    trust_remote_code=True
-)
-processor = AutoProcessor.from_pretrained(
-    "microsoft/Florence-2-large-ft",
-    trust_remote_code=True
-)
-```
-
----
-
-## 파일 구조
+## 📁 파일 구조
 
 ```
 .
-├── train.py           # 학습 스크립트
-├── test.py            # 추론 스크립트
-├── requirements.txt   # Python 의존성
-├── README.md          # 본 문서
-└── outputs/           # 학습 결과물 (생성됨)
-    └── florence2_bbox/
-        └── best/      # 최고 성능 모델 체크포인트
+├── model.py          # 모델 정의 (ResNet50 + BiGRU + Cross-Attention)
+├── preprocess.py     # 데이터 전처리 및 로딩
+├── train.py          # 학습 스크립트
+├── test.py           # 추론 스크립트
+├── requirements.txt  # 의존성 패키지
+├── README.md         # 본 문서
+└── data/             # 데이터 디렉토리
+    ├── train/
+    │   ├── press_json/
+    │   ├── press_jpg/
+    │   ├── report_json/
+    │   └── report_jpg/
+    └── valid/
+        ├── press_json/
+        ├── press_jpg/
+        ├── report_json/
+        └── report_jpg/
 ```
 
 ---
 
-## 예상 학습 시간
+## 🚀 실행 방법
 
-### RTX 3090 (24GB) 기준
-- **1 Epoch**: 약 15-20분 (train 8000 samples, batch_size=32)
-- **전체 학습 (10 epochs)**: 약 2.5-3시간
-- **Validation**: 약 3-5분 per epoch
-
-### 메모리 사용량
-- **Batch size 32**: ~22GB VRAM
-- **Batch size 16**: ~12GB VRAM
-- **Batch size 8**: ~7GB VRAM
-
----
-
-## 트러블슈팅
-
-### CUDA Out of Memory
-```bash
-# Batch size 줄이기
-python train.py --batch_size 16  # 또는 8
-```
-
-### 학습 속도 개선
-```bash
-# num_workers 조정
-python train.py --num_workers 4  # CPU 코어 수에 맞게 조정
-```
-
-### 모델 로딩 에러
-```bash
-# 캐시 삭제 후 재다운로드
-rm -rf ~/.cache/huggingface/
-python train.py  # 모델 재다운로드
-```
-
----
-
-## 성능 향상 팁
-
-1. **데이터 증강**: 현재 코드에는 기본 증강만 포함. 추가 증강 고려
-2. **하이퍼파라미터 튜닝**: Learning rate, batch size, epochs 조정
-3. **앙상블**: 여러 체크포인트 결과 평균
-4. **후처리**: 예측된 bbox의 이상치 필터링
-
----
-
-## 제출 방법
-
-1. 학습 완료 후 best model 확인
-2. 테스트 데이터로 추론 실행
-3. 생성된 CSV 파일 제출
+### 1. 환경 설정
 
 ```bash
-# 전체 파이프라인
-python train.py [학습 인자]
-python test.py --model_dir ./outputs/florence2_bbox/best --output_csv submission.csv
-# submission.csv 제출
+# 의존성 설치
+pip install -r requirements.txt
 ```
+
+### 2. 학습
+
+**Press + Report 데이터 동시 학습** (권장):
+
+```bash
+python train.py \
+  --train_json_dirs ./data/train/press_json ./data/train/report_json \
+  --train_img_roots ./data/train/press_jpg ./data/train/report_jpg \
+  --val_json_dirs ./data/valid/press_json ./data/valid/report_json \
+  --val_img_roots ./data/valid/press_jpg ./data/valid/report_jpg \
+  --epochs 50 \
+  --batch_size 16 \
+  --accumulation_steps 2 \
+  --warmup_epochs 5 \
+  --use_ema \
+  --use_amp \
+  --pretrained \
+  --patience 15 \
+  --save_dir ./checkpoints \
+  --log_dir ./logs
+```
+
+**단일 디렉토리 학습** (호환성):
+
+```bash
+python train.py \
+  --train_json_dir ./data/train/press_json \
+  --train_img_root ./data/train/press_jpg \
+  --val_json_dir ./data/valid/press_json \
+  --val_img_root ./data/valid/press_jpg \
+  --epochs 50 \
+  --batch_size 16 \
+  --use_ema \
+  --use_amp \
+  --pretrained
+```
+
+### 3. 추론
+
+```bash
+python test.py \
+  --test_dir ./data/test \
+  --checkpoint ./checkpoints/best_model.pt \
+  --output_csv submission.csv \
+  --enable_tta
+```
+
+**출력**: `submission.csv` 파일 생성
+- 열 구성: `query_id`, `query_text`, `pred_x`, `pred_y`, `pred_w`, `pred_h`
+- 좌표 형식: (x, y, w, h) - 좌상단 기준 픽셀 좌표
 
 ---
 
-## 라이센스
+## 🏗️ 모델 아키텍처
 
-본 프로젝트는 대회 목적으로만 사용됩니다.
+### 주요 구성 요소
 
-## 참고 자료
-- [Florence-2 Paper](https://arxiv.org/abs/2311.06242)
-- [Hugging Face Model Card](https://huggingface.co/microsoft/Florence-2-large-ft)
-- [대회 페이지](https://dacon.io)
+1. **이미지 인코더**: ResNet50 (Pretrained on ImageNet)
+   - 문서 이미지 → 2D Feature Map
+
+2. **텍스트 인코더**: Bidirectional GRU
+   - 자연어 질의 → 텍스트 임베딩
+   - Character-level tokenization (한국어/영어 지원)
+
+3. **Cross-Attention**: Multi-Head Attention (8 heads)
+   - 질의와 이미지 특징 융합
+
+4. **BBox Regressor**: 2-layer MLP
+   - 정규화된 BBox 좌표 예측 (cx, cy, w, h)
+
+### 손실 함수
+
+- **CIoU Loss**: Complete IoU Loss (weight=2.0)
+- **L1 Loss**: Smooth L1 Loss (weight=1.0)
+- **Combined Loss**: `2.0 * CIoU + 1.0 * L1`
+
+### 학습 기법
+
+- ✅ EMA (Exponential Moving Average, decay=0.9999)
+- ✅ Cosine Annealing LR with Warmup (5 epochs)
+- ✅ Gradient Clipping (max_norm=1.0)
+- ✅ Gradient Accumulation (steps=2)
+- ✅ Mixed Precision Training (AMP)
+- ✅ Early Stopping (patience=15)
+
+### 데이터 증강
+
+- **Training**: ColorJitter, GaussianBlur, RandomRotation
+- **Validation**: Resize + Normalize only
+
+### Test Time Augmentation (TTA)
+
+- Horizontal Flip
+- Prediction Averaging
+
+---
+
+## 📊 예상 성능
+
+| 구성 | mIoU | 특징 |
+|------|------|------|
+| 단일 모델 (Press) | 0.72-0.76 | EMA, CIoU Loss |
+| Press + Report | 0.77-0.81 | 데이터 2배 |
+| + TTA | 0.78-0.82 | 수평 뒤집기 |
+
+---
+
+## 💡 주요 특징
+
+### 1. 멀티 소스 데이터 처리
+- Press + Report 데이터 동시 학습
+- 자동 데이터 통합 및 Vocabulary 생성
+
+### 2. 안정적인 학습
+- EMA로 모델 가중치 안정화
+- Gradient Clipping으로 Exploding Gradient 방지
+- Mixed Precision으로 메모리 효율성 향상
+
+### 3. 강력한 손실 함수
+- CIoU Loss로 BBox 위치, 크기, 비율 동시 최적화
+- L1 Loss로 smooth regression
+
+### 4. Character-level Tokenization
+- 한국어 문자 단위 토크나이징
+- OOV (Out-of-Vocabulary) 문제 해결
+
+---
+
+## 🔧 하이퍼파라미터
+
+| 파라미터 | 기본값 | 설명 |
+|---------|--------|------|
+| `--epochs` | 50 | 총 학습 에폭 |
+| `--batch_size` | 16 | 배치 크기 |
+| `--lr` | 1e-4 | 학습률 |
+| `--warmup_epochs` | 5 | Warmup 에폭 수 |
+| `--accumulation_steps` | 2 | Gradient Accumulation |
+| `--ciou_weight` | 2.0 | CIoU Loss 가중치 |
+| `--patience` | 15 | Early Stopping patience |
+| `--img_size` | 512 | 입력 이미지 크기 |
+| `--embed_dim` | 256 | 임베딩 차원 |
+| `--num_heads` | 8 | Attention Head 수 |
+
+---
+
+## 📝 제출 형식
+
+**CSV 파일 구조**:
+
+```csv
+query_id,query_text,pred_x,pred_y,pred_w,pred_h
+MI2_240725_TY2_0001_1.jpg,감염병전문병원 추진 개요,512.34,345.67,234.12,156.89
+```
+
+- `query_id`: 이미지 파일명
+- `query_text`: 질의 텍스트
+- `pred_x`, `pred_y`: BBox 좌상단 좌표 (픽셀)
+- `pred_w`, `pred_h`: BBox 너비/높이 (픽셀)
+
+---
+
+## ⚠️ 주의사항
+
+1. **데이터 경로**: 실제 환경에 맞게 경로 수정 필요
+2. **GPU 메모리**: batch_size 조정 (OOM 발생 시 줄이기)
+3. **학습 시간**: 전체 데이터 50 epoch 학습 시 약 10-14시간 소요
+4. **TTA**: 추론 시간 2배 증가하지만 성능 향상
+
+---
+
+## 📚 참고 자료
+
+- **ResNet**: Deep Residual Learning for Image Recognition (He et al., 2015)
+- **CIoU Loss**: Enhancing Geometric Factors in Model Learning and Inference for Object Detection and Instance Segmentation (Zheng et al., 2020)
+- **EMA**: Mean teachers are better role models (Tarvainen & Valpola, 2017)
+
+---
+
+## 👥 개발자
+
+Uni_D_18_VLL Team
+
+---
+
+## 📄 라이선스
+
+본 프로젝트는 대회 제출용 코드입니다.

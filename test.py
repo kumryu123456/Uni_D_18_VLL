@@ -1,78 +1,119 @@
+"""
+FINAL OPTIMIZED Test & Inference Script - Maximum IoU Performance
+✅ Test Time Augmentation (TTA)
+✅ Model Ensemble Support
+✅ EMA Weight Loading
+✅ Robust Error Handling
+✅ High-quality Predictions
+"""
+
 import os
 import json
-import re
+import argparse
 from glob import glob
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 import torch
-from torch.utils.data import Dataset, DataLoader
-from PIL import Image
+import numpy as np
 import pandas as pd
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image, ImageOps
 from tqdm import tqdm
 
-from transformers import (
-    AutoConfig,
-    AutoProcessor,
-    AutoModelForCausalLM,
+from preprocess import (
+    Vocabulary,
+    is_visual_element,
+    validate_json_file,
+    seed_everything,
 )
 
-# ==============================
-# 기본 설정
-# ==============================
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-MODEL_ID = "microsoft/Florence-2-large-ft"  # 학습 때 썼던 base 모델 ID
+# Device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ==============================
-# 유틸 함수들
-# ==============================
-def seed_everything(seed: int = 42):
-    import random
-    import numpy as np
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def read_json(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
+# ==================== Helper Functions ====================
+def read_json(json_path: str) -> Dict[str, Any]:
+    """Read and parse JSON file"""
+    with open(json_path, 'r', encoding='utf-8') as f:
         return json.load(f)
+
+
+def normalize_bbox(bbox: list, width: int, height: int) -> list:
+    """
+    Normalize bbox from [x, y, w, h] (pixels) to [cx, cy, w, h] (0-1).
+
+    Args:
+        bbox: [x, y, w, h] in pixels
+        width: Image width
+        height: Image height
+
+    Returns:
+        [cx, cy, w, h] normalized to [0, 1]
+    """
+    x, y, w, h = bbox
+    cx = (x + w / 2.0) / width
+    cy = (y + h / 2.0) / height
+    nw = w / width
+    nh = h / height
+    return [cx, cy, nw, nh]
+
+
+def denormalize_bbox(bbox_norm: list, width: int, height: int) -> list:
+    """
+    Denormalize bbox from [cx, cy, w, h] (0-1) to [x, y, w, h] (pixels).
+
+    Args:
+        bbox_norm: [cx, cy, w, h] normalized
+        width: Image width
+        height: Image height
+
+    Returns:
+        [x, y, w, h] in pixels
+    """
+    cx, cy, nw, nh = bbox_norm
+    w = nw * width
+    h = nh * height
+    x = (cx - nw / 2.0) * width
+    y = (cy - nh / 2.0) * height
+    return [x, y, w, h]
 
 
 def get_image_path(json_path: str, data: Dict[str, Any], jpg_root: str) -> str:
     """
-    MI3 json → MI2 jpg 경로 찾기.
-    train에서 사용하던 것과 동일한 로직을 test에 맞게 재사용.
-    - jpg_root: ./data/test/images  같은 디렉토리
+    Find corresponding JPG image for JSON annotation file.
+
+    Args:
+        json_path: Path to JSON file
+        data: Parsed JSON data
+        jpg_root: Root directory for images
+
+    Returns:
+        Path to corresponding image
+
+    Raises:
+        FileNotFoundError: If image cannot be found
     """
     src = data.get("source_data_info", {})
     jpg_name = src.get("source_data_name_jpg", None)
 
-    # case 1: 메타데이터에 jpg_name이 명시되어 있는 경우
     if jpg_name:
         cand = os.path.join(jpg_root, jpg_name)
         if os.path.exists(cand):
             return cand
 
-        # json 경로 기준으로 json → jpg 폴더 치환 (혹시 구조가 비슷한 경우 대비)
         maybe = json_path.replace(os.sep + "json" + os.sep, os.sep + "jpg" + os.sep)
         maybe = os.path.join(os.path.dirname(maybe), jpg_name)
         if os.path.exists(maybe):
             return maybe
 
-        # MI3 → MI2 이름만 바꿔서 시도
-        base = os.path.basename(json_path)  # 예: MI3_000001.json
+        base = os.path.basename(json_path)
         jpg_base = base.replace("MI3", "MI2").rsplit(".", 1)[0] + ".jpg"
         sibling = os.path.join(jpg_root, jpg_base)
         if os.path.exists(sibling):
             return sibling
 
-    # case 2: 메타데이터가 없으면 파일명 기반으로 매칭
     base = os.path.basename(json_path)
-    stem = os.path.splitext(base)[0]  # 예: 000001.json → 000001
+    stem = os.path.splitext(base)[0]
     cand1 = os.path.join(jpg_root, stem + ".jpg")
     cand2 = os.path.join(jpg_root, stem.replace("MI3", "MI2") + ".jpg")
 
@@ -81,145 +122,48 @@ def get_image_path(json_path: str, data: Dict[str, Any], jpg_root: str) -> str:
     if os.path.exists(cand2):
         return cand2
 
-    raise FileNotFoundError(f"[get_image_path] JPG not found for json={json_path}")
+    raise FileNotFoundError(f"JPG not found for {json_path}")
 
 
-def parse_florence_output_to_bbox(
-    text: str, img_w: int, img_h: int
-) -> Tuple[float, float, float, float]:
-    """
-    Florence-2 출력에서 <loc_?> 토큰 4개를 파싱해서
-    실제 이미지 좌표계(x, y, w, h)로 변환.
-    """
-    matches = re.findall(r"<loc_(\d+)>", text)
-    if len(matches) < 4:
-        # 실패 시: 이미지 중앙에 적당한 박스
-        return img_w / 4, img_h / 4, img_w / 2, img_h / 2
+class TestDataset(Dataset):
+    """Test dataset for inference."""
 
-    lx1, ly1, lx2, ly2 = map(int, matches[:4])
-    x1 = lx1 / 999 * img_w
-    y1 = ly1 / 999 * img_h
-    x2 = lx2 / 999 * img_w
-    y2 = ly2 / 999 * img_h
-    return x1, y1, x2 - x1, y2 - y1
-
-
-def is_visual_ann(a: Dict[str, Any]) -> bool:
-    """
-    train에서 쓰던 것과 비슷하게,
-    차트/표 등 + visual_instruction 있는 것만 사용.
-    """
-    cid = str(a.get("class_id", "") or "")
-    cname = str(a.get("class_name", "") or "")
-    has_q = bool(str(a.get("visual_instruction", "") or "").strip())
-    looks_visual = cid.startswith("V") or any(
-        k in cname for k in ["표", "차트", "그래프", "chart", "table"]
-    )
-    return has_q and looks_visual
-
-
-# ==============================
-# 모델 로더
-# ==============================
-def load_finetuned_model(model_dir: str):
-    """
-    - config/구조는 항상 base MODEL_ID에서 가져오고
-    - weight만 model_dir(checkpoint)에서 로드한다.
-    이렇게 해야 vision_config assertion 에러를 피할 수 있음.
-    """
-    print(f"[load_finetuned_model] base model: {MODEL_ID}")
-    print(f"[load_finetuned_model] finetuned weights from: {model_dir}")
-
-    # 1) base config + 모델 구조
-    base_config = AutoConfig.from_pretrained(
-        MODEL_ID,
-        trust_remote_code=True,
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_ID,
-        config=base_config,
-        trust_remote_code=True,
-        torch_dtype=torch.float32,  # 추론은 fp32로 안전하게
-    ).to(DEVICE)
-
-    # 2) fine-tuned 가중치 로드
-    weight_path_bin = os.path.join(model_dir, "pytorch_model.bin")
-    weight_path_sf = os.path.join(model_dir, "model.safetensors")
-
-    if os.path.exists(weight_path_bin):
-        state_dict = torch.load(weight_path_bin, map_location="cpu")
-        print(f"  - loaded weights from {weight_path_bin}")
-    elif os.path.exists(weight_path_sf):
-        from safetensors.torch import load_file
-
-        state_dict = load_file(weight_path_sf)
-        print(f"  - loaded weights from {weight_path_sf}")
-    else:
-        raise FileNotFoundError(
-            f"No weights found in {model_dir} (expected pytorch_model.bin or model.safetensors)"
-        )
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    print(f"  - missing keys   : {len(missing)}")
-    print(f"  - unexpected keys: {len(unexpected)}")
-
-    # 3) processor는 fine-tune 시 저장한 디렉토리에서 로드
-    processor = AutoProcessor.from_pretrained(
-        model_dir,
-        trust_remote_code=True,
-    )
-
-    return model, processor
-
-
-# ==============================
-# Test Dataset
-# ==============================
-class FlorenceTestDataset(Dataset):
-    """
-    test 디렉토리 구조 가정:
-      data/test/
-        ├─ query/   : *.json (MI3_....json)
-        └─ images/  : *.jpg  (MI2_....jpg)
-
-    - json_path + get_image_path()로 이미지 경로를 찾는다.
-    - query_id  : annotation.instance_id
-    - query_text: annotation.visual_instruction
-    """
-
-    def __init__(self, test_dir: str):
+    def __init__(self, test_dir: str, vocab: Vocabulary, img_size: int = 512):
+        """
+        Args:
+            test_dir: Test data directory
+            vocab: Vocabulary instance
+            img_size: Image size for resizing
+        """
         json_dir = os.path.join(test_dir, "query")
         jpg_root = os.path.join(test_dir, "images")
 
         json_files = sorted(glob(os.path.join(json_dir, "*.json")))
         self.samples: List[Dict[str, Any]] = []
+        self.vocab = vocab
+        self.img_size = img_size
 
         if not json_files:
-            print(f"[FlorenceTestDataset] No json files found in {json_dir}")
+            print(f"⚠️ No JSON files found in {json_dir}")
 
         for jf in json_files:
+            if not validate_json_file(jf):
+                continue
+
             try:
                 data = read_json(jf)
-            except Exception as e:
-                print(f"[WARN] failed to read {jf}: {e}")
+            except Exception:
                 continue
 
-            # 이미지 경로 (json 하나당 이미지 하나라고 가정)
             try:
                 img_path = get_image_path(jf, data, jpg_root)
-            except FileNotFoundError as e:
-                # print(f"[WARN] {e}")
+            except FileNotFoundError:
                 continue
 
-            # annotation 리스트에서 visual한 것만 사용
-            ann_list = (
-                data.get("learning_data_info", {})
-                .get("annotation", [])
-            )
+            ann_list = data.get("learning_data_info", {}).get("annotation", [])
 
             for ann in ann_list:
-                if not is_visual_ann(ann):
+                if not is_visual_element(ann):
                     continue
 
                 instance_id = str(ann.get("instance_id", "") or "").strip()
@@ -228,16 +172,13 @@ class FlorenceTestDataset(Dataset):
                 if not instance_id or not qtext:
                     continue
 
-                self.samples.append(
-                    {
-                        "query_id": instance_id,          # 🔹 CSV용
-                        "query_text": qtext,              # 🔹 CSV용
-                        "question_for_model": "<CAPTION_TO_PHRASE_GROUNDING>" + qtext,
-                        "image_path": img_path,
-                    }
-                )
+                self.samples.append({
+                    "query_id": instance_id,
+                    "query_text": qtext,
+                    "image_path": img_path,
+                })
 
-        print(f"[TestDataset] Loaded {len(self.samples)} items")
+        print(f"✅ Test dataset loaded: {len(self.samples)} samples")
 
     def __len__(self):
         return len(self.samples)
@@ -245,119 +186,357 @@ class FlorenceTestDataset(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         img = Image.open(s["image_path"]).convert("RGB")
-        img_w, img_h = img.size
+        orig_w, orig_h = img.size
+
+        # Resize
+        img_resized = img.resize((self.img_size, self.img_size), Image.BILINEAR)
+
+        # Tokenize
+        tokens = self.vocab.tokenize(s["query_text"])
+        token_ids = self.vocab.encode(tokens)
+        text_len = len(token_ids)
+
+        # To tensor
+        img_tensor = torch.from_numpy(np.array(img_resized)).permute(2, 0, 1).float() / 255.0
 
         meta = {
-            "img_size": (img_w, img_h),
+            "orig_size": (orig_w, orig_h),
             "image_path": s["image_path"],
             "query_text": s["query_text"],
         }
 
-        # 모델 입력: (query_id, question_for_model, image, meta)
-        return s["query_id"], s["question_for_model"], img, meta
+        return s["query_id"], img_tensor, token_ids, text_len, img, meta
 
 
-def make_collate_fn(processor):
-    def collate_fn(batch):
-        qids, questions, images, metas = zip(*batch)
-        inputs = processor(
-            text=list(questions),
-            images=list(images),
-            return_tensors="pt",
-            padding=True,
-        )
-        return list(qids), inputs, list(metas)
+def collate_fn_test(batch):
+    """
+    Collate function for test data loader.
 
-    return collate_fn
+    Args:
+        batch: List of samples
+
+    Returns:
+        Batched tensors and metadata
+    """
+    query_ids, img_tensors, token_lists, text_lens, orig_images, metas = zip(*batch)
+
+    # Stack images
+    images = torch.stack(img_tensors, dim=0)
+
+    # Pad token sequences
+    max_len = max(text_lens)
+    batch_size = len(query_ids)
+
+    text_ids = torch.zeros(batch_size, max_len, dtype=torch.long)
+    for i, tokens in enumerate(token_lists):
+        text_ids[i, :len(tokens)] = torch.tensor(tokens, dtype=torch.long)
+
+    text_lens_tensor = torch.tensor(text_lens, dtype=torch.long)
+
+    return list(query_ids), images, text_ids, text_lens_tensor, list(orig_images), list(metas)
 
 
-# ==============================
-# Inference 루프
-# ==============================
-def run_test(model, processor, loader: DataLoader, output_csv: str = "./submission.csv"):
+def load_model(checkpoint_path: str, device):
+    """
+    Load trained model from checkpoint.
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        device: Device to load model on
+
+    Returns:
+        model: Loaded model
+        vocab: Vocabulary instance
+        args: Training arguments
+    """
+    from model import create_model
+
+    print(f"📦 Loading checkpoint from: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+
+    # Restore vocabulary
+    vocab = Vocabulary()
+    vocab.vocab = checkpoint["vocab"]
+    vocab.idx2word = checkpoint["idx2word"]
+
+    # Get model config
+    train_args = checkpoint.get("args", {})
+    vocab_size = len(vocab)
+
+    # Create model
+    model = create_model(
+        vocab_size=vocab_size,
+        embed_dim=train_args.get("embed_dim", 256),
+        backbone=train_args.get("backbone", "resnet50"),
+        pretrained=False,  # Don't need pretrained for inference
+        num_heads=train_args.get("num_heads", 8),
+        dropout=train_args.get("dropout", 0.1),
+    )
+
+    # Load weights
+    model.load_state_dict(checkpoint["model_state"])
+    model = model.to(device)
     model.eval()
-    results = []
+
+    # Load EMA weights if available
+    if "ema_shadow" in checkpoint:
+        print("✅ Loading EMA weights")
+        for name, param in model.named_parameters():
+            if name in checkpoint["ema_shadow"]:
+                param.data = checkpoint["ema_shadow"][name].to(device)
+
+    best_iou = checkpoint.get("best_iou", 0.0)
+    epoch = checkpoint.get("epoch", 0)
+
+    print(f"✅ Model loaded successfully")
+    print(f"   Epoch: {epoch}, Best IoU: {best_iou:.4f}")
+    print(f"   Vocab size: {vocab_size}")
+
+    return model, vocab, train_args
+
+
+def load_ensemble_models(checkpoint_paths: List[str], device):
+    """
+    Load multiple models for ensemble.
+
+    Args:
+        checkpoint_paths: List of checkpoint paths
+        device: Device to load models on
+
+    Returns:
+        models: List of loaded models
+        vocab: Vocabulary instance (from first model)
+    """
+    models = []
+    vocab = None
+
+    for i, ckpt_path in enumerate(checkpoint_paths):
+        if os.path.exists(ckpt_path):
+            print(f"\n📦 Loading ensemble model {i+1}/{len(checkpoint_paths)}: {ckpt_path}")
+            model, v, _ = load_model(ckpt_path, device)
+            models.append(model)
+
+            if vocab is None:
+                vocab = v
+
+    if not models:
+        raise ValueError("No valid models found for ensemble")
+
+    print(f"\n✅ Loaded {len(models)} models for ensemble")
+    return models, vocab
+
+
+def apply_tta(model, images, text_ids, text_lens, device):
+    """
+    Apply Test Time Augmentation (TTA).
+
+    Args:
+        model: Model to use
+        images: [B, 3, H, W] image tensor
+        text_ids: [B, L] text token IDs
+        text_lens: [B] text lengths
+        device: Device
+
+    Returns:
+        predictions: List of [original_pred, flipped_pred]
+    """
+    predictions = []
+
+    # 1. Original prediction
+    with torch.no_grad():
+        pred = model(images, text_ids, text_lens)
+        pred = torch.clamp(pred, 0.0, 1.0)
+        predictions.append(pred)
+
+    # 2. Horizontal flip prediction
+    images_flip = torch.flip(images, dims=[3])  # Flip width dimension
 
     with torch.no_grad():
-        pbar = tqdm(loader, desc="Test inference")
+        pred_flip = model(images_flip, text_ids, text_lens)
+        pred_flip = torch.clamp(pred_flip, 0.0, 1.0)
 
-        for qids, inputs, metas in pbar:
-            # device로 올리기
-            for k, v in inputs.items():
-                if isinstance(v, torch.Tensor):
-                    inputs[k] = v.to(DEVICE)
+        # Unflip predictions: cx_flip = 1 - cx
+        pred_flip_unflipped = pred_flip.clone()
+        pred_flip_unflipped[:, 0] = 1.0 - pred_flip[:, 0]  # Flip cx back
 
-            # pixel_values dtype 맞추기
-            if "pixel_values" in inputs:
-                inputs["pixel_values"] = inputs["pixel_values"].to(model.dtype)
+        predictions.append(pred_flip_unflipped)
 
-            # Florence-2 generate
-            gen_ids = model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=32,
-                num_beams=3,
-                do_sample=False,
-                pad_token_id=processor.tokenizer.pad_token_id,
-                eos_token_id=processor.tokenizer.eos_token_id,
-            )
+    return predictions
 
-            texts = processor.batch_decode(gen_ids, skip_special_tokens=False)
 
-            for qid, text, meta in zip(qids, texts, metas):
-                img_w, img_h = meta["img_size"]
-                x, y, w, h = parse_florence_output_to_bbox(text, img_w, img_h)
+def merge_tta_predictions(tta_preds: List[torch.Tensor]) -> torch.Tensor:
+    """
+    Merge TTA predictions using averaging.
 
-                results.append(
-                    {
-                        "query_id": qid,
-                        "query_text": meta["query_text"],  # 🔹 CSV에 visual_instruction 그대로
-                        "pred_x": x,
-                        "pred_y": y,
-                        "pred_w": w,
-                        "pred_h": h,
-                    }
-                )
+    Args:
+        tta_preds: List of [B, 4] predictions
 
-    # 컬럼 순서 명시
+    Returns:
+        [B, 4] averaged predictions
+    """
+    # Stack and average
+    stacked = torch.stack(tta_preds, dim=0)  # [N, B, 4]
+    avg_pred = stacked.mean(dim=0)  # [B, 4]
+    return avg_pred
+
+
+@torch.no_grad()
+def run_inference(
+    models: List,
+    loader: DataLoader,
+    output_csv: str,
+    device,
+    enable_tta: bool = True,
+):
+    """
+    Run inference with TTA and optional ensemble.
+
+    Args:
+        models: List of models (single or ensemble)
+        loader: Data loader
+        output_csv: Output CSV file path
+        device: Device
+        enable_tta: Enable Test Time Augmentation
+    """
+    for model in models:
+        model.eval()
+
+    results = []
+    use_ensemble = len(models) > 1
+
+    with torch.no_grad():
+        pbar = tqdm(loader, desc=f"Inference (TTA={enable_tta}, Ensemble={use_ensemble})")
+
+        for query_ids, images, text_ids, text_lens, orig_images, metas in pbar:
+            # Move to device
+            images = images.to(device)
+            text_ids = text_ids.to(device)
+            text_lens = text_lens.to(device)
+
+            batch_size = len(query_ids)
+            ensemble_predictions = []
+
+            # Ensemble: run each model
+            for model in models:
+                if enable_tta:
+                    # TTA for this model
+                    tta_preds = apply_tta(model, images, text_ids, text_lens, device)
+                    merged_pred = merge_tta_predictions(tta_preds)
+                else:
+                    # No TTA, just original
+                    pred = model(images, text_ids, text_lens)
+                    merged_pred = torch.clamp(pred, 0.0, 1.0)
+
+                ensemble_predictions.append(merged_pred)
+
+            # Ensemble: average all model predictions
+            if use_ensemble:
+                stacked = torch.stack(ensemble_predictions, dim=0)  # [M, B, 4]
+                final_pred = stacked.mean(dim=0)  # [B, 4]
+            else:
+                final_pred = ensemble_predictions[0]
+
+            # Convert to numpy
+            final_pred = final_pred.cpu().numpy()  # [B, 4]
+
+            # Process each sample
+            for i in range(batch_size):
+                orig_w, orig_h = metas[i]["orig_size"]
+                bbox_norm = final_pred[i]  # [4] in [0, 1]
+
+                # Denormalize to original image size
+                bbox_abs = denormalize_bbox(bbox_norm.tolist(), orig_w, orig_h)
+                x, y, w, h = bbox_abs
+
+                results.append({
+                    "query_id": query_ids[i],
+                    "query_text": metas[i]["query_text"],
+                    "pred_x": x,
+                    "pred_y": y,
+                    "pred_w": w,
+                    "pred_h": h,
+                })
+
+    # Save to CSV
     df = pd.DataFrame(
         results,
         columns=["query_id", "query_text", "pred_x", "pred_y", "pred_w", "pred_h"],
     )
-    df.to_csv(output_csv, index=False)
-    print(f"[Done] Saved submission to {output_csv}")
+    df.to_csv(output_csv, index=False, encoding='utf-8-sig')
+
+    print(f"\n✅ Submission saved to: {output_csv}")
+    print(f"📊 Total predictions: {len(results)}")
 
 
-# ==============================
-# main
-# ==============================
 def main():
-    import argparse
+    """Main inference function."""
+    parser = argparse.ArgumentParser(description="FINAL Test Inference with TTA & Ensemble")
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--test_dir", type=str, default="./data/test")
-    parser.add_argument("--model_dir", type=str, default="./outputs/florence2_bbox/best")
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--output_csv", type=str, default="./my_submission.csv")
+    parser.add_argument("--test_dir", type=str, default="./data/test", help="Test data directory")
+    parser.add_argument("--checkpoint", type=str, default="./checkpoints_final/best_model.pt",
+                       help="Model checkpoint path")
+    parser.add_argument("--ensemble_checkpoints", type=str, nargs='+', default=None,
+                       help="Additional checkpoints for ensemble")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
+    parser.add_argument("--output_csv", type=str, default="./submission_final.csv", help="Output CSV file")
+    parser.add_argument("--img_size", type=int, default=512, help="Input image size")
+    parser.add_argument("--enable_tta", action="store_true", default=True, help="Enable TTA")
+    parser.add_argument("--disable_tta", action="store_true", help="Disable TTA (faster)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+
     args = parser.parse_args()
 
-    seed_everything(42)
+    seed_everything(args.seed)
 
-    # 1) 모델 / 프로세서 로드
-    model, processor = load_finetuned_model(args.model_dir)
+    enable_tta = args.enable_tta and not args.disable_tta
 
-    # 2) Dataset / DataLoader
-    test_ds = FlorenceTestDataset(args.test_dir)
+    print("="*70)
+    print("🚀 FINAL OPTIMIZED INFERENCE - Maximum IoU Performance")
+    print("="*70)
+    print(f"Device: {DEVICE}")
+    print(f"Test Directory: {args.test_dir}")
+    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Batch Size: {args.batch_size}")
+    print(f"TTA Enabled: {enable_tta}")
+
+    # Prepare model checkpoints
+    checkpoint_paths = [args.checkpoint]
+    if args.ensemble_checkpoints:
+        checkpoint_paths.extend(args.ensemble_checkpoints)
+        print(f"Ensemble Models: {len(checkpoint_paths)}")
+    print("="*70)
+
+    # Load models
+    print("\n🧠 Loading models...")
+    models, vocab = load_ensemble_models(checkpoint_paths, DEVICE)
+
+    # Create test dataset
+    print("\n📂 Loading test data...")
+    test_ds = TestDataset(args.test_dir, vocab, img_size=args.img_size)
+
+    if len(test_ds) == 0:
+        print("❌ No test samples found!")
+        return
+
+    # Create data loader
     loader = DataLoader(
         test_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=0,
-        collate_fn=make_collate_fn(processor),
+        collate_fn=collate_fn_test,
     )
 
-    # 3) Inference & CSV 저장
-    run_test(model, processor, loader, args.output_csv)
+    # Run inference
+    print("\n🔮 Running inference...")
+    run_inference(models, loader, args.output_csv, DEVICE, enable_tta)
+
+    print("\n" + "="*70)
+    print("🎉 Inference Complete!")
+    print("="*70)
+    print(f"✅ Submission file ready: {args.output_csv}")
+    print("👉 Upload this file to the competition platform")
+    print("="*70)
 
 
 if __name__ == "__main__":
